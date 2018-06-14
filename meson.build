@@ -1,5 +1,5 @@
 project('lollypop-portal',
-  version: '0.9.7',
+  version: '0.9.7_redux',
   meson_version: '>= 0.40.0'
 )
 python = import('python3')
