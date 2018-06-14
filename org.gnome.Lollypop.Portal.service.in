@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=org.gnome.Lollypop.Portal
+Exec=@libexecdir@/lollypop-portal

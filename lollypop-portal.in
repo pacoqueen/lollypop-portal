@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# Copyright (c) 2014-2016 Cedric Bellegarde <cedric.bellegarde@adishatz.org>
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+"""
+lollypop-portal run as a background process and export some functionalities
+to lollypop. First time lollypop is launched, lollypop-portal is launched too.
+"""
+
+# pylint: disable=invalid-name,wrong-import-position
+
+import os
+import sys
+from re import findall, DOTALL
+import gi
+from gi.repository import Gio, Gst, GLib
+
+gi.require_version('Gst', '1.0')
+# Make sure we'll find the pygobject module, even in JHBuild
+sys.path.insert(1, '@pyexecdir@')
+# Make sure we'll find the lollypop modules, even in JHBuild
+sys.path.insert(1, '@pythondir@')
+
+
+# pylint: disable=too-few-public-methods
+class Server:
+    """
+    lollypop-portal server exposed on dbus.
+    """
+    def __init__(self, con, path):
+        method_outargs = {}
+        method_inargs = {}
+        for interface in Gio.DBusNodeInfo.new_for_xml(self.__doc__).interfaces:
+
+            for method in interface.methods:
+                method_outargs[method.name] = '(' + ''.join(
+                    [arg.signature for arg in method.out_args]) + ')'
+                method_inargs[method.name] = tuple(
+                    arg.signature for arg in method.in_args)
+
+            con.register_object(object_path=path,
+                                interface_info=interface,
+                                method_call_closure=self.on_method_call)
+
+        self.method_inargs = method_inargs
+        self.method_outargs = method_outargs
+
+    # pylint: disable=too-many-arguments,too-many-locals
+    def on_method_call(self,
+                       connection,      # pylint: disable=unused-argument
+                       sender,          # pylint: disable=unused-argument
+                       object_path,     # pylint: disable=unused-argument
+                       interface_name,  # pylint: disable=unused-argument
+                       method_name,
+                       parameters,
+                       invocation):
+        """Handler for get and return values after method invocation."""
+        args = list(parameters.unpack())
+        for i, sig in enumerate(self.method_inargs[method_name]):
+            if sig == 'h':
+                msg = invocation.get_message()
+                fd_list = msg.get_unix_fd_list()
+                args[i] = fd_list.get(args[i])
+
+        try:
+            result = getattr(self, method_name)(*args)
+
+            # out_args is atleast (signature1).
+            # We therefore always wrap the result as a tuple.
+            # Refer to https://bugzilla.gnome.org/show_bug.cgi?id=765603
+            result = (result,)
+
+            out_args = self.method_outargs[method_name]
+            if out_args != '()':
+                variant = GLib.Variant(out_args, result)
+                invocation.return_value(variant)
+            else:
+                invocation.return_value(None)
+        except Exception as e:  # pylint: disable=unused-variable,broad-except
+            pass
+
+
+class PortalLollypopService(Server, Gio.Application):
+    '''
+    <!DOCTYPE node PUBLIC
+    '-//freedesktop//DTD D-BUS Object Introspection 1.0//EN'
+    'http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd'>
+    <node>
+    <interface name="org.gnome.Lollypop.Portal">
+
+    <method name="PaListSinks">
+      <arg type="aas" name="results" direction="out" />
+    </method>
+    <method name="CanSetCover">
+      <arg type="b" name="can" direction="out" />
+    </method>
+    <method name="SetCover">
+      <arg type="s" name="audio" direction="in" />
+      <arg type="s" name="cover" direction="in" />
+    </method>
+    <method name="CanLaunchTagEditor">
+      <arg type="s" name="editor" direction="in" />
+      <arg type="b" name="can" direction="out" />
+    </method>
+    <method name="LaunchTagEditor">
+      <arg type="s" name="editor" direction="in" />
+      <arg type="s" name="f" direction="in" />
+    </method>
+    <method name="SetPopularity">
+      <arg type="i" name="pop" direction="in" />
+      <arg type="s" name="f" direction="in" />
+    </method>
+    <method name="LaunchFileManager">
+      <arg type="s" name="filepath" direction="in" />
+    </method>
+
+    </interface>
+    </node>
+    '''
+    __LOLLYPOP_BUS = 'org.gnome.Lollypop.Portal'
+    __SEARCH_BUS = 'org.gnome.Lollypop.Portal'
+    __PATH_BUS = '/org/gnome/LollypopPortal'
+
+    def __init__(self):
+        Gio.Application.__init__(self,
+                                 application_id='org.gnome.Lollypop.Portal',
+                                 flags=Gio.ApplicationFlags.IS_SERVICE)
+        self.__bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        Gio.bus_own_name_on_connection(self.__bus,
+                                       self.__SEARCH_BUS,
+                                       Gio.BusNameOwnerFlags.NONE,
+                                       None,
+                                       None)
+        Server.__init__(self, self.__bus, self.__PATH_BUS)
+
+    # pylint: disable=no-self-use
+    def CanSetCover(self):
+        """True if cover can be set throught kid3-cli."""
+        return GLib.find_program_in_path("kid3-cli") is not None
+
+    # pylint: disable=no-self-use
+    def PaListSinks(self):
+        """Return PulseAudio sinks."""
+        ret = []
+        argv = ["pacmd", "list-sinks", None]
+        try:
+            # pylint: disable=unused-variable
+            (s, out, err, e) = GLib.spawn_sync(None, argv, None,
+                                               GLib.SpawnFlags.SEARCH_PATH,
+                                               None)
+            string = out.decode('utf-8')
+            devices = findall('name: <([^>]*)>', string, DOTALL)
+            names = findall('device.description = "([^"]*)"', string, DOTALL)
+            for name in names:
+                ret.append([name, devices.pop(0)])
+        except Exception as e:  # pylint: disable=broad-except,unused-variable
+            print("PortalLollypopService::PaListSinks()", e)
+        return ret
+
+    # pylint: disable=no-self-use
+    def SetCover(self, audio, cover):
+        """Changes cover in audio file using kid3-cli."""
+        argv = ["kid3-cli", "-c", "select all", "-c",
+                "set picture:'%s' ''" % cover, audio, None]
+        GLib.spawn_async(None, argv, None,
+                         GLib.SpawnFlags.SEARCH_PATH, None)
+
+    def CanLaunchTagEditor(self, editor):
+        """True if any tag editor can be launched."""
+        if GLib.find_program_in_path(editor) is not None:
+            return True
+        return False
+
+    def LaunchTagEditor(self, editor, f):
+        """
+        Launch fist tag editor installed following this order:
+        1. KDE audio tag editor (Qt GUI).
+        2. ExFalso
+        3. Easytag
+        4. Musicbrainz Picard
+        5. Puddletag
+        """
+        TAG_EDITORS = ["kid3-qt", "exfalso", "easytag", "picard", "puddletag"]
+        if editor not in TAG_EDITORS:
+            return
+        argv = [editor, f]
+        GLib.spawn_async(argv, flags=GLib.SpawnFlags.SEARCH_PATH)
+
+    def SetPopularity(self, pop, f):
+        """Save popularity on file through kid3-cli."""
+        argv = ["kid3-cli", "-c", "set POPM %s" % pop, f]
+        GLib.spawn_async(argv, flags=GLib.SpawnFlags.SEARCH_PATH)
+
+    def LaunchFileManager(self, filepath):
+        """
+        Open path received on system's file manager.
+        @param filepath as string
+        """
+        if os.path.isfile(filepath):
+            comando = ['nautilus']
+            strpath = os.path.abspath(os.path.dirname(filepath))
+            argv = ["-s", filepath]
+        else:
+            comando = ['xdg-open']
+            strpath = filepath
+            argv = [strpath]
+        argv = comando + argv
+        GLib.spawn_async(argv, flags=GLib.SpawnFlags.SEARCH_PATH)
+
+def main():
+    """
+    Main routine.
+    """
+    Gst.init(None)
+    service = PortalLollypopService()
+    service.hold()
+    service.run()
+
+
+if __name__ == '__main__':
+    main()
